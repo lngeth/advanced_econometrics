@@ -11,6 +11,11 @@ import seaborn as sns
 
 from sklearn.preprocessing import StandardScaler
 
+from sklearn.metrics import roc_auc_score, balanced_accuracy_score, recall_score, precision_score, f1_score, roc_curve, auc, confusion_matrix
+from sklearn.metrics import ConfusionMatrixDisplay
+from sklearn.model_selection import GridSearchCV
+
+
 
 def search_description(all_descriptions, name_variable):
   # Vérifier si l'index existe
@@ -388,3 +393,124 @@ def align_date_ranges(df, category, date_col, variables):
   
   # Recombiner tous les DataFrames alignés
   return pd.concat(aligned_dfs, ignore_index=True)
+
+def train_test_with_cv(
+    model,
+    param_grid,
+    X_train,
+    y_train,
+    X_test,
+    y_test,
+    model_name="Model",
+    scoring="roc_auc",  # or "balanced_accuracy"
+    cv=5,
+    n_jobs=-1,
+    verbose=1,
+    plot_roc=True,
+    threshold=None  # New parameter for custom threshold
+):
+    # Initialize GridSearchCV
+    search = GridSearchCV(
+        estimator=model,
+        param_grid=param_grid,
+        scoring=scoring,
+        cv=cv,
+        n_jobs=n_jobs,
+        verbose=verbose,
+        refit=True  # Best params re-fitted automatically
+    )
+
+    # Fit on the entire training set (CV happens internally)
+    search.fit(X_train, y_train)
+    
+    best_model = search.best_estimator_
+    print(f"Best params ({model_name}): {search.best_params_}")
+    print(f"Best CV {scoring} Score: {search.best_score_:.3f}\n")
+    print("Class ordering:", best_model.classes_)
+    
+    # Determine if model uses decision_function or predict_proba
+    if hasattr(best_model, "predict_proba"):
+        pos_index = list(best_model.classes_).index(1)
+        y_train_proba = best_model.predict_proba(X_train)[:, pos_index]
+        y_test_proba = best_model.predict_proba(X_test)[:, pos_index]
+    elif hasattr(best_model, "decision_function"):
+        # Use decision function for thresholding
+        decision_train = best_model.decision_function(X_train)
+        y_train_proba = (decision_train - decision_train.min()) / (decision_train.max() - decision_train.min())
+        
+        decision_test = best_model.decision_function(X_test)
+        y_test_proba = (decision_test - decision_test.min()) / (decision_test.max() - decision_test.min())
+    else:
+        raise AttributeError("Model does not have predict_proba or decision_function methods.")
+    
+    y_train_pred = best_model.predict(X_train)
+    y_test_pred = best_model.predict(X_test)
+    
+    train_auc = roc_auc_score(y_train, y_train_proba)
+    train_bal_acc = balanced_accuracy_score(y_train, y_train_pred)
+    train_recall = recall_score(y_train, y_train_pred)
+    
+    test_auc = roc_auc_score(y_test, y_test_proba)
+    test_bal_acc = balanced_accuracy_score(y_test, y_test_pred)
+    test_recall = recall_score(y_test, y_test_pred)
+    
+    # Print metrics
+    print(f"{model_name} Train AUC: {train_auc:.3f}")
+    print(f"{model_name} Train Balanced Acc: {train_bal_acc:.3f}")
+    print(f"{model_name} Train Recall: {train_recall:.3f}")
+    print(f"{model_name} Test AUC: {test_auc:.3f}")
+    print(f"{model_name} Test Balanced Acc: {test_bal_acc:.3f}")
+    print(f"{model_name} Test Recall: {test_recall:.3f}\n")
+    
+    # Plot ROC curves
+    if plot_roc:
+        fpr_train, tpr_train, _ = roc_curve(y_train, y_train_proba)
+        fpr_test, tpr_test, _ = roc_curve(y_test, y_test_proba)
+    
+        plt.figure(figsize=(8,6))
+        plt.plot(fpr_train, tpr_train, label=f"Train (AUC={auc(fpr_train, tpr_train):.3f})")
+        plt.plot(fpr_test, tpr_test, label=f"Test (AUC={auc(fpr_test, tpr_test):.3f})")
+        plt.plot([0,1],[0,1], "--", color="gray")
+        plt.title(f"{model_name} ROC curve")
+        plt.xlabel("FPR")
+        plt.ylabel("TPR")
+        plt.legend(loc="lower right")
+        plt.show()
+    
+    # Handle custom threshold if provided
+    if threshold is not None:
+        # For SVM without predict_proba, use decision function
+        if hasattr(best_model, "decision_function"):
+            y_test_custom = (best_model.decision_function(X_test) > 0).astype(int)
+        else:
+            y_test_custom = (y_test_proba > threshold).astype(int)
+        
+        # Calculate metrics based on custom threshold
+        recall_custom = recall_score(y_test, y_test_custom)
+        precision_custom = precision_score(y_test, y_test_custom)
+        f1_custom = f1_score(y_test, y_test_custom)
+        roc_auc_custom = roc_auc_score(y_test, y_test_proba)  # AUC remains based on probabilities
+    
+        print(f"Metrics with Custom Threshold ({threshold}):")
+        print(f"Recall: {recall_custom:.3f}")
+        print(f"Precision: {precision_custom:.3f}")
+        print(f"F1 Score: {f1_custom:.3f}")
+        print(f"ROC AUC: {roc_auc_custom:.3f}\n")
+    
+        # Optional: Plot confusion matrix or other relevant plots
+        cm = confusion_matrix(y_test, y_test_custom)
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=best_model.classes_)
+        disp.plot(cmap=plt.cm.Blues)
+        plt.title(f"{model_name} Confusion Matrix at Threshold {threshold}")
+        plt.show()
+    
+        if hasattr(best_model, "decision_function"):
+            # For SVM, compare custom threshold with default predict
+            y_test_custom_compare = (best_model.decision_function(X_test) > 0).astype(int)
+            print("Default Predictions:", y_test_pred[:10])
+            print("Custom Threshold Predictions:", y_test_custom_compare[:10])
+            print("Are they identical?", np.array_equal(y_test_pred, y_test_custom_compare))
+        else:
+            print("Default and Custom threshold predictions may differ based on threshold logic.")
+    
+    return best_model
